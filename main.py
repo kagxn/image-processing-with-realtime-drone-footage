@@ -1,5 +1,6 @@
 import cv2
 
+#v1
 # RTMP yayını buradan alınacak
 rtmp_url = "rtmp://127.0.0.1/live/stream"  # veya IP'li hali: rtmp://192.168.1.x/live/stream
 
