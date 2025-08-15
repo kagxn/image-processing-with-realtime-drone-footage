@@ -1,25 +1,100 @@
+import subprocess
+
 import cv2
 
-#v1
-# RTMP yayını buradan alınacak
-rtmp_url = "rtmp://127.0.0.1/live/stream"  # veya IP'li hali: rtmp://192.168.1.x/live/stream
+import numpy as np
 
-cap = cv2.VideoCapture(rtmp_url)
+import os
 
-if not cap.isOpened():
-    print("Yayına bağlanılamadı.")
-    exit()
+import sys
+
+
+# ffmpeg tam yolu
+
+ffmpeg_path = r"C:\ffmpeg\bin\ffmpeg.exe"
+
+
+# ffmpeg mevcut mu kontrol et
+
+if not os.path.isfile(ffmpeg_path):
+
+    print(f"HATA: ffmpeg yolu bulunamadı: {ffmpeg_path}")
+
+    sys.exit(1)
+
+
+# RTMP yayını (DJI IP veya localhost)
+
+rtmp_url = "rtmp://127.0.0.1/live/stream"  # veya cihazın IP'si
+
+
+# FFmpeg komutu (15 sn buffer ile OpenCV'ye kare gönderir)
+
+cmd = [
+
+    ffmpeg_path,
+
+    "-fflags", "+genpts",
+
+    "-rtmp_buffer", "15000",
+
+    "-i", rtmp_url,
+
+    "-max_delay", "15000000",
+
+    "-f", "image2pipe",
+
+    "-pix_fmt", "bgr24",
+
+    "-vcodec", "rawvideo",
+
+    "-"
+
+]
+
+
+# DJI yayının çözünürlüğü (gerekiyorsa değiştir)
+
+width = 1280
+
+height = 720
+
+
+# FFmpeg sürecini başlat
+
+process = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
+
 
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Görüntü alınamadı.")
+
+    # Kare boyutunu hesapla ve oku
+
+    raw_image = process.stdout.read(width * height * 3)
+
+    if not raw_image:
+
         break
 
-    cv2.imshow("DJI Live", frame)
+
+    # Numpy array'e çevir
+
+    frame = np.frombuffer(raw_image, dtype=np.uint8).reshape((height, width, 3))
+
+
+    # Görüntüyü göster
+
+    cv2.imshow("DJI Live (15s Buffer)", frame)
+
+
+    # Çıkış için 'q' tuşu
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
+
         break
 
-cap.release()
+
+# Temizlik
+
+process.terminate()
+
 cv2.destroyAllWindows()

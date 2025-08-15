@@ -4,5 +4,6 @@ services:
     image: ossrs/srs:5
     container_name: dji_live_srs
     ports:
-      - "1935:1935"     # RTMP portu
-      - "8080:8080"     # Web panel (test için)
+      - "1935:1935"     # RTMP
+      - "8080:8080"     # Web panel (opsiyonel)
+    restart: unless-stopped
