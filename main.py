@@ -7,7 +7,6 @@ import time
 import threading
 import tkinter as tk
 from tkinter import messagebox
-import re
 
 # ============= CONFIG =============
 ffmpeg_path = r"C:\ffmpeg\bin\ffmpeg.exe"   # FFmpeg yolu
@@ -18,6 +17,7 @@ height = 720
 
 SRS_NAME  = "dji_live_srs"
 SRS_IMAGE = "ossrs/srs:5"
+FIXED_IP  = "192.168.137.1"
 # ==================================
 
 
@@ -33,57 +33,6 @@ def open_mobile_hotspot_settings():
             ["explorer.exe", "ms-settings:network-mobilehotspot"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-
-
-def parse_blocks_from_ipconfig(text: str):
-    return re.split(r"\r?\n\r?\n", text)
-
-
-def get_hotspot_ip():
-    """ipconfig’ten özellikle hotspot adaptöründeki IPv4’ü bul."""
-    try:
-        out = subprocess.check_output(["ipconfig"], encoding="utf-8", errors="ignore")
-    except Exception:
-        return "127.0.0.1", "ipconfig okunamadı"
-
-    blocks = parse_blocks_from_ipconfig(out)
-    ipv4_regex = re.compile(r"IPv4[^:]*:\s*([\d.]+)")
-    title_regex = re.compile(r"^(.*?):\s*$", re.MULTILINE)
-
-    # 1) Hedef: Wireless LAN adapter Yerel Ağ Bağlantısı*
-    hotspot_patterns = [
-        r"Wireless\s*LAN.*Yerel\s*Ağ\s*Bağlantısı\*?\s*\d*",
-        r"Kablosuz\s*LAN.*Yerel\s*Ağ\s*Bağlantısı\*?\s*\d*",
-        r"Wireless\s*LAN.*Local\s*Area\s*Connection\*?\s*\d*",
-    ]
-
-    def find_ip(patterns):
-        for b in blocks:
-            m_title = title_regex.search(b)
-            title = m_title.group(1).strip() if m_title else ""
-            for pat in patterns:
-                if re.search(pat, title, flags=re.IGNORECASE):
-                    m_ip = ipv4_regex.search(b)
-                    if m_ip:
-                        ip = m_ip.group(1)
-                        if ip != "127.0.0.1":
-                            return ip, title
-        return None
-
-    res = find_ip(hotspot_patterns)
-    if res: return res
-
-    # fallback: ilk bulunan IPv4
-    for b in blocks:
-        m_ip = ipv4_regex.search(b)
-        if m_ip:
-            ip = m_ip.group(1)
-            if ip != "127.0.0.1":
-                m_title = title_regex.search(b)
-                title = m_title.group(1).strip() if m_title else "(başlık yok)"
-                return ip, title
-
-    return "127.0.0.1", "IP bulunamadı"
 
 
 def docker_available():
@@ -194,17 +143,12 @@ tk.Label(root, text="DJI RTMP Görüntüleyici", font=("Segoe UI", 14, "bold")).
 info_frame = tk.Frame(root)
 info_frame.pack(pady=5, fill="x", padx=12)
 
-adapter_label = tk.Label(info_frame, text="Adaptör: -", font=("Segoe UI", 11))
-adapter_label.grid(row=0, column=0, sticky="w", padx=4, pady=2, columnspan=2)
-
-ip_label = tk.Label(info_frame, text="Yerel IP: -", font=("Segoe UI", 11))
-ip_label.grid(row=1, column=0, sticky="w", padx=4, pady=2, columnspan=2)
-
-rtmp_label = tk.Label(info_frame, text="RTMP URL: -", font=("Segoe UI", 11))
-rtmp_label.grid(row=2, column=0, sticky="w", padx=4, pady=2, columnspan=2)
+rtmp_url = f"rtmp://{FIXED_IP}/live/stream"
+rtmp_label = tk.Label(info_frame, text=f"RTMP URL: {rtmp_url}", font=("Segoe UI", 11))
+rtmp_label.grid(row=0, column=0, sticky="w", padx=4, pady=2, columnspan=2)
 
 buffer_label = tk.Label(info_frame, text=f"Buffer: {rtmp_buffer_ms/1000:.0f} sn", font=("Segoe UI", 11))
-buffer_label.grid(row=3, column=0, sticky="w", padx=4, pady=2)
+buffer_label.grid(row=1, column=0, sticky="w", padx=4, pady=2)
 
 status_frame = tk.Frame(root)
 status_frame.pack(pady=10, fill="x", padx=12)
@@ -219,16 +163,7 @@ fps_label = tk.Label(status_frame, text="FPS: -", font=("Segoe UI", 11))
 fps_label.pack(anchor="w", pady=2)
 
 
-def on_fetch_ip():
-    ip, title = get_hotspot_ip()
-    rtmp_url = f"rtmp://{ip}/live/stream"
-    set_label(adapter_label, f"Adaptör: {title}")
-    set_label(ip_label, f"Yerel IP: {ip}")
-    set_label(rtmp_label, f"RTMP URL: {rtmp_url}")
-
-
 def on_connect():
-    rtmp_url = rtmp_label.cget("text").replace("RTMP URL: ", "")
     s = ensure_srs()
     set_label(docker_label, f"Docker: {s}")
     threading.Thread(target=start_stream, args=(rtmp_url,), daemon=True).start()
@@ -237,11 +172,8 @@ def on_connect():
 btn_frame = tk.Frame(root)
 btn_frame.pack(pady=16)
 
-tk.Button(btn_frame, text="IP’yi Çek", command=on_fetch_ip,
-          font=("Segoe UI", 11, "bold"), bg="#0277bd", fg="white", width=14).grid(row=0, column=0, padx=6)
-
 tk.Button(btn_frame, text="Bağlan", command=on_connect,
-          font=("Segoe UI", 11, "bold"), bg="#2e7d32", fg="white", width=14).grid(row=0, column=1, padx=6)
+          font=("Segoe UI", 11, "bold"), bg="#2e7d32", fg="white", width=14).pack()
 
 tk.Label(root, text="OpenCV penceresi açıkken 'q' ile çıkabilirsiniz.", font=("Segoe UI", 9), fg="#666").pack(pady=4)
 
