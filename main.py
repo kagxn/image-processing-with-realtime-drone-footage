@@ -1,144 +1,248 @@
+# main.py
 import subprocess
-import re
-import os
-import sys
-import time
 import cv2
 import numpy as np
+import os
+import time
+import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
+import re
 
-# ================= #
-# Hotspot Açma      #
-# ================= #
-def start_hotspot():
+# ============= CONFIG =============
+ffmpeg_path = r"C:\ffmpeg\bin\ffmpeg.exe"   # FFmpeg yolu
+rtmp_buffer_ms = 15000       # 15 sn
+max_delay_us   = 15000000    # 15 sn
+width = 1280
+height = 720
+
+SRS_NAME  = "dji_live_srs"
+SRS_IMAGE = "ossrs/srs:5"
+# ==================================
+
+
+def open_mobile_hotspot_settings():
+    """Windows Mobil Etkin Nokta ayarlarını aç."""
     try:
-        subprocess.run(
-            'netsh wlan set hostednetwork mode=allow ssid=DJIHotspot key=12345678',
-            shell=True, check=True
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-Command", "Start-Process ms-settings:network-mobilehotspot"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        subprocess.run(
-            'netsh wlan start hostednetwork',
-            shell=True, check=True
+    except Exception:
+        subprocess.Popen(
+            ["explorer.exe", "ms-settings:network-mobilehotspot"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        time.sleep(5)
-    except subprocess.CalledProcessError:
-        messagebox.showerror("Hata", "Hotspot açılamadı! Scripti Yönetici olarak çalıştır.")
-        sys.exit(1)
 
-# ================= #
-# IP Alma           #
-# ================= #
+
+def parse_blocks_from_ipconfig(text: str):
+    return re.split(r"\r?\n\r?\n", text)
+
+
 def get_hotspot_ip():
-    result = subprocess.check_output("ipconfig", encoding="utf-8", errors="ignore")
-    blocks = result.split("\n\n")
-    for block in blocks:
-        if "Wireless LAN adapter" in block and "Yerel Ağ Bağlantısı" in block:
-            match = re.search(r"IPv4.*?:\s*([\d.]+)", block)
-            if match:
-                return match.group(1)
-    return None
+    """ipconfig’ten özellikle hotspot adaptöründeki IPv4’ü bul."""
+    try:
+        out = subprocess.check_output(["ipconfig"], encoding="utf-8", errors="ignore")
+    except Exception:
+        return "127.0.0.1", "ipconfig okunamadı"
 
-# ================= #
-# Docker SRS Run    #
-# ================= #
-def start_docker_srs():
-    cmd = "docker ps -q --filter 'name=srs'"
-    running = subprocess.check_output(cmd, shell=True).decode().strip()
-    if not running:
-        subprocess.run("docker run -d --name srs --restart always -p 1935:1935 ossrs/srs:5", shell=True)
-        time.sleep(3)
+    blocks = parse_blocks_from_ipconfig(out)
+    ipv4_regex = re.compile(r"IPv4[^:]*:\s*([\d.]+)")
+    title_regex = re.compile(r"^(.*?):\s*$", re.MULTILINE)
 
-# ================= #
-# FFmpeg Yayını     #
-# ================= #
-def start_ffmpeg_stream(rtmp_url, ffmpeg_path, width=1280, height=720, delay=15):
+    # 1) Hedef: Wireless LAN adapter Yerel Ağ Bağlantısı*
+    hotspot_patterns = [
+        r"Wireless\s*LAN.*Yerel\s*Ağ\s*Bağlantısı\*?\s*\d*",
+        r"Kablosuz\s*LAN.*Yerel\s*Ağ\s*Bağlantısı\*?\s*\d*",
+        r"Wireless\s*LAN.*Local\s*Area\s*Connection\*?\s*\d*",
+    ]
+
+    def find_ip(patterns):
+        for b in blocks:
+            m_title = title_regex.search(b)
+            title = m_title.group(1).strip() if m_title else ""
+            for pat in patterns:
+                if re.search(pat, title, flags=re.IGNORECASE):
+                    m_ip = ipv4_regex.search(b)
+                    if m_ip:
+                        ip = m_ip.group(1)
+                        if ip != "127.0.0.1":
+                            return ip, title
+        return None
+
+    res = find_ip(hotspot_patterns)
+    if res: return res
+
+    # fallback: ilk bulunan IPv4
+    for b in blocks:
+        m_ip = ipv4_regex.search(b)
+        if m_ip:
+            ip = m_ip.group(1)
+            if ip != "127.0.0.1":
+                m_title = title_regex.search(b)
+                title = m_title.group(1).strip() if m_title else "(başlık yok)"
+                return ip, title
+
+    return "127.0.0.1", "IP bulunamadı"
+
+
+def docker_available():
+    try:
+        subprocess.run(["docker", "--version"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_srs():
+    if not docker_available():
+        return "Docker bulunamadı"
+    exists = subprocess.run(["docker", "inspect", SRS_NAME],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if exists:
+        try:
+            status = subprocess.check_output(
+                ["docker", "inspect", "-f", "{{.State.Running}}", SRS_NAME],
+                encoding="utf-8"
+            ).strip()
+        except subprocess.CalledProcessError:
+            status = "false"
+        if status.lower() == "true":
+            return "SRS zaten çalışıyor"
+        else:
+            rc = subprocess.run(["docker", "start", SRS_NAME]).returncode
+            return "SRS başlatıldı" if rc == 0 else "SRS başlatılamadı"
+    else:
+        rc = subprocess.run([
+            "docker", "run", "-d",
+            "--name", SRS_NAME,
+            "-p", "1935:1935", "-p", "8080:8080",
+            "--restart", "unless-stopped",
+            SRS_IMAGE
+        ]).returncode
+        return "SRS oluşturuldu" if rc == 0 else "SRS oluşturulamadı"
+
+
+def start_stream(rtmp_url):
+    if not os.path.isfile(ffmpeg_path):
+        messagebox.showerror("Hata", f"FFmpeg bulunamadı: {ffmpeg_path}")
+        return
+
     cmd = [
         ffmpeg_path,
         "-fflags", "+genpts",
-        "-rtmp_buffer", str(delay * 1000),
+        "-rtmp_buffer", str(rtmp_buffer_ms),
         "-i", rtmp_url,
-        "-max_delay", str(delay * 1000000),
+        "-max_delay", str(max_delay_us),
         "-f", "image2pipe",
         "-pix_fmt", "bgr24",
         "-vcodec", "rawvideo",
         "-"
     ]
+
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
+    set_label(connection_label, "Bağlantı: Bağlanıyor...")
+
+    frame_count, t0 = 0, time.time()
 
     while True:
-        raw_image = process.stdout.read(width * height * 3)
-        if not raw_image:
+        raw = process.stdout.read(width * height * 3)
+        if not raw:
+            set_label(connection_label, "Bağlantı: HATA - Yayın yok!")
             break
 
-        frame = np.frombuffer(raw_image, dtype=np.uint8).reshape((height, width, 3))
-        cv2.imshow("DJI Live (Buffer)", frame)
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+        frame_count += 1
+        elapsed = time.time() - t0
+        if elapsed >= 2.0:
+            fps = frame_count / elapsed
+            set_label(fps_label, f"FPS: {fps:.2f}")
+            set_label(connection_label, "Bağlantı: Aktif")
+            frame_count, t0 = 0, time.time()
 
+        overlay = frame.copy()
+        info = f"{rtmp_url} | Buffer: {rtmp_buffer_ms/1000:.0f}s"
+        cv2.putText(overlay, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255,255,255), 2, cv2.LINE_AA)
+        cv2.imshow("DJI Live (Buffered)", overlay)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     process.terminate()
     cv2.destroyAllWindows()
+    set_label(connection_label, "Bağlantı: Kapalı")
 
-# ================= #
-# GUI Arayüz        #
-# ================= #
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("DJI RTMP Stream")
-        self.root.geometry("400x250")
 
-        # ffmpeg yolu
-        self.ffmpeg_path = r"C:\ffmpeg\bin\ffmpeg.exe"
+def set_label(lbl, text):
+    try:
+        lbl.after(0, lbl.config, {"text": text})
+    except Exception:
+        pass
 
-        # Hotspot + Docker başlat
-        start_hotspot()
-        self.ip = get_hotspot_ip()
-        if not self.ip:
-            messagebox.showerror("Hata", "Hotspot IP bulunamadı!")
-            sys.exit(1)
 
-        start_docker_srs()
+# ==== UI ====
+root = tk.Tk()
+root.title("DJI RTMP Stream Controller")
+root.geometry("560x420")
 
-        # RTMP URL
-        self.rtmp_url = f"rtmp://{self.ip}/live/stream"
+# mobil etkin nokta ekranını aç
+open_mobile_hotspot_settings()
 
-        # UI Elemanları
-        ttk.Label(root, text=f"RTMP URL: {self.rtmp_url}").pack(pady=10)
+tk.Label(root, text="DJI RTMP Görüntüleyici", font=("Segoe UI", 14, "bold")).pack(pady=10)
 
-        ttk.Label(root, text="FPS:").pack()
-        self.fps_entry = ttk.Entry(root)
-        self.fps_entry.insert(0, "30")
-        self.fps_entry.pack(pady=5)
+info_frame = tk.Frame(root)
+info_frame.pack(pady=5, fill="x", padx=12)
 
-        ttk.Label(root, text="Buffer (saniye):").pack()
-        self.delay_entry = ttk.Entry(root)
-        self.delay_entry.insert(0, "15")
-        self.delay_entry.pack(pady=5)
+adapter_label = tk.Label(info_frame, text="Adaptör: -", font=("Segoe UI", 11))
+adapter_label.grid(row=0, column=0, sticky="w", padx=4, pady=2, columnspan=2)
 
-        self.start_btn = ttk.Button(root, text="Yayını Başlat", command=self.run_stream)
-        self.start_btn.pack(pady=15)
+ip_label = tk.Label(info_frame, text="Yerel IP: -", font=("Segoe UI", 11))
+ip_label.grid(row=1, column=0, sticky="w", padx=4, pady=2, columnspan=2)
 
-    def run_stream(self):
-        try:
-            fps = int(self.fps_entry.get())
-            delay = int(self.delay_entry.get())
-        except ValueError:
-            messagebox.showerror("Hata", "FPS ve Buffer sayı olmalı.")
-            return
+rtmp_label = tk.Label(info_frame, text="RTMP URL: -", font=("Segoe UI", 11))
+rtmp_label.grid(row=2, column=0, sticky="w", padx=4, pady=2, columnspan=2)
 
-        if not os.path.isfile(self.ffmpeg_path):
-            messagebox.showerror("Hata", f"ffmpeg bulunamadı: {self.ffmpeg_path}")
-            return
+buffer_label = tk.Label(info_frame, text=f"Buffer: {rtmp_buffer_ms/1000:.0f} sn", font=("Segoe UI", 11))
+buffer_label.grid(row=3, column=0, sticky="w", padx=4, pady=2)
 
-        self.root.destroy()  # UI kapat
-        start_ffmpeg_stream(self.rtmp_url, self.ffmpeg_path, delay=delay)
+status_frame = tk.Frame(root)
+status_frame.pack(pady=10, fill="x", padx=12)
 
-# ================= #
-# MAIN              #
-# ================= #
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+docker_label = tk.Label(status_frame, text="Docker: -", font=("Segoe UI", 11))
+docker_label.pack(anchor="w", pady=2)
+
+connection_label = tk.Label(status_frame, text="Bağlantı: -", font=("Segoe UI", 11))
+connection_label.pack(anchor="w", pady=2)
+
+fps_label = tk.Label(status_frame, text="FPS: -", font=("Segoe UI", 11))
+fps_label.pack(anchor="w", pady=2)
+
+
+def on_fetch_ip():
+    ip, title = get_hotspot_ip()
+    rtmp_url = f"rtmp://{ip}/live/stream"
+    set_label(adapter_label, f"Adaptör: {title}")
+    set_label(ip_label, f"Yerel IP: {ip}")
+    set_label(rtmp_label, f"RTMP URL: {rtmp_url}")
+
+
+def on_connect():
+    rtmp_url = rtmp_label.cget("text").replace("RTMP URL: ", "")
+    s = ensure_srs()
+    set_label(docker_label, f"Docker: {s}")
+    threading.Thread(target=start_stream, args=(rtmp_url,), daemon=True).start()
+
+
+btn_frame = tk.Frame(root)
+btn_frame.pack(pady=16)
+
+tk.Button(btn_frame, text="IP’yi Çek", command=on_fetch_ip,
+          font=("Segoe UI", 11, "bold"), bg="#0277bd", fg="white", width=14).grid(row=0, column=0, padx=6)
+
+tk.Button(btn_frame, text="Bağlan", command=on_connect,
+          font=("Segoe UI", 11, "bold"), bg="#2e7d32", fg="white", width=14).grid(row=0, column=1, padx=6)
+
+tk.Label(root, text="OpenCV penceresi açıkken 'q' ile çıkabilirsiniz.", font=("Segoe UI", 9), fg="#666").pack(pady=4)
+
+root.mainloop()
