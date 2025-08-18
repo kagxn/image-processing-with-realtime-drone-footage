@@ -28,51 +28,70 @@ SRS_IMAGE = "ossrs/srs:5"
 # ==================================
 
 
-def get_local_ip():
+def get_hotspot_ip():
     """
-    Windows 'ipconfig' çıktısından IPv4 adresini bulur.
-    Öncelik: 'Ethernet bağdaştırıcısı Yerel Ağ Bağlantısı' (yerel ağ),
-    sonra 'Kablosuz LAN bağdaştırıcısı Wi-Fi'.
-    Hiçbiri bulunamazsa ilk bulunan IPv4'ü döndürür, olmadı 127.0.0.1.
+    Windows 'ipconfig' çıktısından 'Kablosuz LAN bağdaştırıcısı Yerel Ağ Bağlantısı'
+    (veya İng: 'Wireless LAN adapter Local Area Connection*') bloğundaki IPv4'ü döndürür.
+    Bulamazsa Wi-Fi, yine yoksa ilk IPv4; en sonda 127.0.0.1.
+    Ayrıca eşleşen başlığı da döndürür.
     """
     try:
-        # Türkçe Windows'ta kod sayfası farklı olabilir; ignore ile güvenli
         out = subprocess.check_output(["ipconfig"], encoding="utf-8", errors="ignore")
     except Exception:
-        return "127.0.0.1"
+        return "127.0.0.1", "ipconfig okunamadı"
 
     # bloklara ayır
     blocks = re.split(r"\r?\n\r?\n", out)
-
     ipv4_regex = re.compile(r"IPv4[^:]*:\s*([\d.]+)")
+    title_regex = re.compile(r"^(.*?):\s*$", re.MULTILINE)
 
-    target_order = [
-        # Türkçe başlık örnekleri
-        r"Ethernet.*Yerel.*Ağ.*Bağlantısı",    # Ethernet bağdaştırıcısı Yerel Ağ Bağlantısı
-        r"Kablosuz.*LAN.*(Wi-?Fi|Kablosuz)",   # Kablosuz LAN bağdaştırıcısı Wi-Fi
-        r"Wireless.*LAN.*(Wi-?Fi)",            # İngilizce olasılık
-        r"Ethernet adapter.*Local Area",       # İngilizce olasılık
+    # Hedef adaptör başlık örüntüleri (TR & EN)
+    target_patterns = [
+        r"Kablosuz\s*LAN.*Yerel\s*Ağ\s*Bağlantısı\*?\s*\d*",   # TR Hotspot Local Area Connection*
+        r"Wireless\s*LAN.*Local\s*Area\s*Connection\*?\s*\d*", # EN Hotspot Local Area Connection*
     ]
 
-    # 1) Öncelikli başlıklarda ara
-    for pat in target_order:
+    # Wi-Fi yedeği (TR & EN)
+    wifi_patterns = [
+        r"Kablosuz\s*LAN.*Wi-?Fi",
+        r"Wireless\s*LAN.*Wi-?Fi",
+    ]
+
+    def find_ip_by_patterns(patterns):
         for b in blocks:
-            if re.search(pat, b, flags=re.IGNORECASE):
-                m = ipv4_regex.search(b)
-                if m:
-                    ip = m.group(1)
-                    if ip != "127.0.0.1":
-                        return ip
+            # blok başlığı
+            m_title = title_regex.search(b)
+            title = m_title.group(1).strip() if m_title else ""
+            for pat in patterns:
+                if re.search(pat, title, flags=re.IGNORECASE):
+                    m_ip = ipv4_regex.search(b)
+                    if m_ip:
+                        ip = m_ip.group(1)
+                        if ip != "127.0.0.1":
+                            return ip, title
+        return None
 
-    # 2) Herhangi bir bloktaki ilk IPv4
+    # 1) Önce hotspot Local Area Connection* adaptörü
+    res = find_ip_by_patterns(target_patterns)
+    if res:
+        return res
+
+    # 2) Wi-Fi adaptörü
+    res = find_ip_by_patterns(wifi_patterns)
+    if res:
+        return res
+
+    # 3) Herhangi bir bloktaki ilk IPv4
     for b in blocks:
-        m = ipv4_regex.search(b)
-        if m:
-            ip = m.group(1)
+        m_ip = ipv4_regex.search(b)
+        if m_ip:
+            ip = m_ip.group(1)
             if ip != "127.0.0.1":
-                return ip
+                m_title = title_regex.search(b)
+                title = m_title.group(1).strip() if m_title else "(başlık yok)"
+                return ip, title
 
-    return "127.0.0.1"
+    return "127.0.0.1", "IP bulunamadı, localhost"
 
 
 def docker_available():
@@ -105,20 +124,22 @@ def ensure_srs():
 
     if exists:
         # Çalışıyor mu?
-        status = subprocess.check_output(
-            ["docker", "inspect", "-f", "{{.State.Running}}", SRS_NAME],
-            encoding="utf-8"
-        ).strip()
+        try:
+            status = subprocess.check_output(
+                ["docker", "inspect", "-f", "{{.State.Running}}", SRS_NAME],
+                encoding="utf-8"
+            ).strip()
+        except subprocess.CalledProcessError:
+            status = "false"
+
         if status.lower() == "true":
             return "SRS zaten çalışıyor"
         else:
-            # start et
             rc = subprocess.run(["docker", "start", SRS_NAME],
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL).returncode
             return "SRS başlatıldı" if rc == 0 else "SRS başlatılamadı"
     else:
-        # yeni container oluştur
         rc = subprocess.run([
             "docker", "run", "-d",
             "--name", SRS_NAME,
@@ -127,6 +148,14 @@ def ensure_srs():
             SRS_IMAGE
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
         return "SRS oluşturulup başlatıldı" if rc == 0 else "SRS oluşturulamadı"
+
+
+def set_label(lbl, text):
+    """Tk label text güncelle (thread-safe)."""
+    try:
+        lbl.after(0, lbl.config, {"text": text})
+    except Exception:
+        pass
 
 
 def start_stream(rtmp_url):
@@ -177,10 +206,11 @@ def start_stream(rtmp_url):
             frame_count = 0
             t0 = time.time()
 
-        # İstersek overlay ile bilgi yazalım (ekstra)
+        # Overlay bilgi
         overlay = frame.copy()
         info = f"{rtmp_url} | Buffer: {rtmp_buffer_ms/1000:.0f}s"
-        cv2.putText(overlay, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(overlay, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 2, cv2.LINE_AA)
         cv2.imshow("DJI Live (Buffered)", overlay)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -193,14 +223,6 @@ def start_stream(rtmp_url):
 
     cv2.destroyAllWindows()
     set_label(connection_label, "Bağlantı: Kapalı")
-
-
-def set_label(lbl, text):
-    """Tk label text güncelle (thread-safe)."""
-    try:
-        lbl.after(0, lbl.config, {"text": text})
-    except Exception:
-        pass
 
 
 def on_start():
@@ -216,10 +238,10 @@ def on_start():
 # ==== UI Hazırlık ====
 root = tk.Tk()
 root.title("DJI RTMP Stream Controller")
-root.geometry("520x360")
+root.geometry("560x380")
 
-# IP ve RTMP url oluştur
-local_ip = get_local_ip()
+# IP ve RTMP url oluştur (özellikle Hotspot Local Area Connection* IP'si hedeflenir)
+local_ip, adapter_title = get_hotspot_ip()
 rtmp_url = f"rtmp://{local_ip}/live/stream"
 
 # Başlık
@@ -229,13 +251,14 @@ tk.Label(root, text="DJI RTMP Görüntüleyici", font=("Segoe UI", 14, "bold")).
 info_frame = tk.Frame(root)
 info_frame.pack(pady=5, fill="x", padx=12)
 
-tk.Label(info_frame, text=f"Yerel IP: {local_ip}", font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", padx=4, pady=2)
-tk.Label(info_frame, text=f"Buffer: {rtmp_buffer_ms/1000:.0f} sn", font=("Segoe UI", 11)).grid(row=1, column=0, sticky="w", padx=4, pady=2)
+tk.Label(info_frame, text=f"Adaptör: {adapter_title}", font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+tk.Label(info_frame, text=f"Yerel IP: {local_ip}", font=("Segoe UI", 11)).grid(row=1, column=0, sticky="w", padx=4, pady=2)
+tk.Label(info_frame, text=f"Buffer: {rtmp_buffer_ms/1000:.0f} sn", font=("Segoe UI", 11)).grid(row=2, column=0, sticky="w", padx=4, pady=2)
 
 rtmp_url_var = tk.StringVar(value=rtmp_url)
-tk.Label(info_frame, text="RTMP URL:", font=("Segoe UI", 11)).grid(row=2, column=0, sticky="w", padx=4, pady=2)
-rtmp_entry = tk.Entry(info_frame, textvariable=rtmp_url_var, width=40, font=("Segoe UI", 10))
-rtmp_entry.grid(row=2, column=1, sticky="w", padx=4, pady=2)
+tk.Label(info_frame, text="RTMP URL:", font=("Segoe UI", 11)).grid(row=3, column=0, sticky="w", padx=4, pady=2)
+rtmp_entry = tk.Entry(info_frame, textvariable=rtmp_url_var, width=44, font=("Segoe UI", 10))
+rtmp_entry.grid(row=3, column=1, sticky="w", padx=4, pady=2)
 
 # Durum alanları
 status_frame = tk.Frame(root)
@@ -254,9 +277,10 @@ fps_label.pack(anchor="w", pady=2)
 btn_frame = tk.Frame(root)
 btn_frame.pack(pady=16)
 
-start_btn = tk.Button(btn_frame, text="Başlat", command=on_start, font=("Segoe UI", 11, "bold"), bg="#2e7d32", fg="white", width=14)
+start_btn = tk.Button(btn_frame, text="Başlat", command=on_start,
+                      font=("Segoe UI", 11, "bold"), bg="#2e7d32", fg="white", width=16)
 start_btn.grid(row=0, column=0, padx=6)
 
-tk.Label(root, text="Pencere açıkken 'q' ile yayından çıkabilirsiniz.", font=("Segoe UI", 9), fg="#666").pack(pady=4)
+tk.Label(root, text="OpenCV penceresi açıkken 'q' ile yayından çıkabilirsiniz.", font=("Segoe UI", 9), fg="#666").pack(pady=4)
 
 root.mainloop()
