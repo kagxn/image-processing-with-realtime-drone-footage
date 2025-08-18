@@ -114,11 +114,10 @@ def start_producer():
 
     cmd = [
         FFMPEG_PATH,
-        "-loglevel", "warning",
+        "-loglevel", "error",          # logları kapat
         "-fflags", "+genpts",
-        "-rtmp_buffer", str(BUFFER_SEC * 1000),          # ms
+        "-rtmp_buffer", str(BUFFER_SEC * 1000),   # ms
         "-i", RTMP_URL,
-        "-max_delay", str(BUFFER_SEC * 1_000_000),       # µs
         "-vf", f"fps={TARGET_FPS},scale={WIDTH}:{HEIGHT}",
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
@@ -126,7 +125,8 @@ def start_producer():
     ]
 
     try:
-        producer_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+        # stderr -> DEVNULL (donma engeli)
+        producer_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
     except Exception as e:
         messagebox.showerror("Hata", f"FFmpeg başlatılamadı:\n{e}")
         return False
@@ -139,37 +139,39 @@ def start_producer():
     running = True
 
     def read_loop():
-        nonlocal frame_bytes
-        def drain_stderr(p):
-            for _ in p.stderr:
-                pass
-        threading.Thread(target=drain_stderr, args=(producer_proc,), daemon=True).start()
-
+        last_frame = None
         while running:
             try:
                 raw = producer_proc.stdout.read(frame_bytes)
                 if not raw:
-                    break
+                    time.sleep(0.01)
+                    continue
+
                 frame = np.frombuffer(raw, dtype=np.uint8)
                 if frame.size != WIDTH * HEIGHT * 3:
                     continue
                 frame = frame.reshape((HEIGHT, WIDTH, 3))
+                last_frame = frame
 
                 with queue_lock:
                     frame_queue.append(frame)
-                    # --- Buffer kontrolü (yeni sürüm: sadece en güncel kareyi tut) ---
+                    # Kuyruk şişerse sadece son kareyi tut
                     if len(frame_queue) > target_frames * 2:
-                        last_frame = frame_queue[-1]
+                        last = frame_queue[-1]
                         frame_queue.clear()
-                        frame_queue.append(last_frame)
+                        frame_queue.append(last)
 
                 with queue_lock:
                     fill = min(len(frame_queue), target_frames)
                 set_progress(pb_buffer, int(fill / target_frames * 100))
-
                 set_label(lbl_conn, "Bağlantı: Yayın alınıyor")
+
             except Exception:
-                break
+                # Hata olursa son kareyi tekrar ekle
+                if last_frame is not None:
+                    with queue_lock:
+                        frame_queue.append(last_frame)
+                time.sleep(0.01)
 
         set_label(lbl_conn, "Bağlantı: Koptu / Yayın yok")
         set_label(lbl_status, "Durum: Beklemede")
@@ -200,7 +202,7 @@ def start_player():
 
         frame_period = 1.0 / TARGET_FPS
         next_deadline = time.perf_counter()
-        last_frame = None  # --- son kareyi saklamak için ---
+        last_frame = None
 
         while running:
             with queue_lock:
@@ -208,7 +210,7 @@ def start_player():
                     frame = frame_queue.popleft()
                     last_frame = frame
                 else:
-                    frame = last_frame  # boşsa son kareyi tekrar et
+                    frame = last_frame
 
             if frame is None:
                 set_label(lbl_status, "Durum: Yeniden tamponlanıyor…")
