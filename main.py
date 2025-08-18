@@ -61,7 +61,6 @@ def ensure_srs():
     if not docker_available():
         return "Docker CLI bulunamadı (Docker Desktop kurulu mu?)"
 
-    # Docker Desktop'ı başlatmayı dene (varsayılan yol)
     docker_desktop_path = r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
     if os.path.isfile(docker_desktop_path):
         try:
@@ -69,7 +68,6 @@ def ensure_srs():
         except Exception:
             pass
 
-    # Engine hazır mı?
     for _ in range(60):  # ~60 sn bekleyebilir
         try:
             subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -79,7 +77,6 @@ def ensure_srs():
     else:
         return "Docker Engine başlatılamadı!"
 
-    # Container var mı?
     exists = subprocess.run(["docker", "inspect", SRS_NAME],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     if exists:
@@ -160,9 +157,11 @@ def start_producer():
 
                 with queue_lock:
                     frame_queue.append(frame)
-                    # --- Buffer kontrolü (YENİ) ---
-                    if len(frame_queue) > target_frames:
-                        frame_queue.popleft()
+                    # --- Buffer kontrolü (Yumuşak boşaltma) ---
+                    if len(frame_queue) > target_frames * 2:
+                        drop = min(20, len(frame_queue) - target_frames)
+                        for _ in range(drop):
+                            frame_queue.popleft()
 
                 with queue_lock:
                     fill = min(len(frame_queue), target_frames)
@@ -201,23 +200,19 @@ def start_player():
 
         frame_period = 1.0 / TARGET_FPS
         next_deadline = time.perf_counter()
+        last_frame = None  # --- son kareyi saklamak için ---
 
         while running:
             with queue_lock:
                 if frame_queue:
                     frame = frame_queue.popleft()
+                    last_frame = frame
                 else:
-                    frame = None
+                    frame = last_frame  # boşsa son kareyi tekrar et
 
             if frame is None:
                 set_label(lbl_status, "Durum: Yeniden tamponlanıyor…")
-                while running:
-                    with queue_lock:
-                        if len(frame_queue) >= target_frames // 2:
-                            break
-                    time.sleep(0.05)
-                set_label(lbl_status, "Durum: Oynatılıyor (30 fps)")
-                next_deadline = time.perf_counter()
+                time.sleep(0.05)
                 continue
 
             overlay = frame.copy()
