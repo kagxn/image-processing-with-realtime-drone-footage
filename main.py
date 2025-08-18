@@ -115,8 +115,6 @@ def start_producer():
         messagebox.showerror("Hata", f"FFmpeg bulunamadı:\n{FFMPEG_PATH}")
         return False
 
-    # FFmpeg: giriş RTMP, çıkış ham bgr24; fps ve scale'i sabitliyoruz
-    # not: -fflags +genpts ve büyük rtmp/max_delay jitter'a dayanıklılık sağlar
     cmd = [
         FFMPEG_PATH,
         "-loglevel", "warning",
@@ -145,7 +143,6 @@ def start_producer():
 
     def read_loop():
         nonlocal frame_bytes
-        # stderr'i sessizce tüket (dolup bloklamasın)
         def drain_stderr(p):
             for _ in p.stderr:
                 pass
@@ -163,19 +160,14 @@ def start_producer():
 
                 with queue_lock:
                     frame_queue.append(frame)
-                    # Kuyruk aşırı büyümesin; yeterince gecikme var
-                    if len(frame_queue) > target_frames * 2:
-                        # en eski kareleri at
-                        drop = len(frame_queue) - target_frames * 2
-                        for _ in range(drop):
-                            frame_queue.popleft()
+                    # --- Buffer kontrolü (YENİ) ---
+                    if len(frame_queue) > target_frames:
+                        frame_queue.popleft()
 
-                # Progress bar güncelle
                 with queue_lock:
                     fill = min(len(frame_queue), target_frames)
                 set_progress(pb_buffer, int(fill / target_frames * 100))
 
-                # UI bilgilendirme
                 set_label(lbl_conn, "Bağlantı: Yayın alınıyor")
             except Exception:
                 break
@@ -189,12 +181,10 @@ def start_producer():
 
 # -------------------- Player (Queue->OpenCV) --------------------
 def start_player():
-    """Kuyruk dolunca (BUFFER_SEC) 30fps sabit oynat. Düşerse tekrar tamponla."""
     global running
 
     def play_loop():
         set_label(lbl_status, "Durum: Buffer dolduruluyor…")
-        # Tampon dolana kadar bekle
         while running:
             with queue_lock:
                 filled = len(frame_queue)
@@ -209,11 +199,9 @@ def start_player():
         set_label(lbl_status, "Durum: Oynatılıyor (30 fps)")
         set_label(lbl_conn, "Bağlantı: Aktif")
 
-        # tam 30 fps zamanlayıcı
         frame_period = 1.0 / TARGET_FPS
         next_deadline = time.perf_counter()
 
-        shown = 0
         while running:
             with queue_lock:
                 if frame_queue:
@@ -222,33 +210,27 @@ def start_player():
                     frame = None
 
             if frame is None:
-                # Kuyruk boşaldı → yeniden tamponla
                 set_label(lbl_status, "Durum: Yeniden tamponlanıyor…")
-                # bekle ve yeniden doldur
                 while running:
                     with queue_lock:
-                        if len(frame_queue) >= target_frames // 2:  # yarısına gelince yeniden başlat
+                        if len(frame_queue) >= target_frames // 2:
                             break
                     time.sleep(0.05)
                 set_label(lbl_status, "Durum: Oynatılıyor (30 fps)")
                 next_deadline = time.perf_counter()
                 continue
 
-            # overlay info (isteğe bağlı)
             overlay = frame.copy()
             info = f"{RTMP_URL} | Buffer hedef: {BUFFER_SEC}s | Target FPS: {TARGET_FPS}"
             cv2.putText(overlay, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
             cv2.imshow("DJI Live (Buffered 30fps)", overlay)
-            shown += 1
 
-            # tam 30 fps pacing
             next_deadline += frame_period
             sleep_time = next_deadline - time.perf_counter()
             if sleep_time > 0:
                 time.sleep(sleep_time)
             else:
-                # geri kaldıysak deadline'ı şimdiki zamana sabitle (drift engelle)
                 next_deadline = time.perf_counter()
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -272,25 +254,21 @@ def on_start():
     if running:
         return
     running = True
-    # Producer
     ok = start_producer()
     if not ok:
         running = False
         return
-    # Player
     start_player()
 
 def on_stop():
     global running, producer_proc
     running = False
-    # FFmpeg kapat
     try:
         if producer_proc:
             producer_proc.terminate()
             producer_proc = None
     except Exception:
         pass
-    # Kuyruğu temizle
     with queue_lock:
         frame_queue.clear()
     set_progress(pb_buffer, 0)
