@@ -1,52 +1,52 @@
-# main.py
-import subprocess
-import cv2
-import numpy as np
-import os
-import time
-import threading
 import tkinter as tk
 from tkinter import messagebox
+import subprocess
+import threading
+import os
+import time
+import cv2
+import numpy as np
 
-# ============= CONFIG =============
-ffmpeg_path = r"C:\ffmpeg\bin\ffmpeg.exe"   # FFmpeg yolu
-rtmp_buffer_ms = 15000       # 15 sn
-max_delay_us   = 15000000    # 15 sn
-width = 1280
-height = 720
-
-SRS_NAME  = "dji_live_srs"
+# --- Global ayarlar ---
+FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"  # kendi ffmpeg yolunu yaz
 SRS_IMAGE = "ossrs/srs:5"
-FIXED_IP  = "192.168.137.1"
-# ==================================
+SRS_NAME = "srs"
+RTMP_URL = "rtmp://192.168.137.1/live/stream"  # mobil etkin nokta IP'si sabit
+FPS = 30
+BUFFER_SECONDS = 15
 
 
-def open_mobile_hotspot_settings():
-    """Windows Mobil Etkin Nokta ayarlarını aç."""
-    try:
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", "Start-Process ms-settings:network-mobilehotspot"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    except Exception:
-        subprocess.Popen(
-            ["explorer.exe", "ms-settings:network-mobilehotspot"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-
-
+# --- Yardımcı fonksiyonlar ---
 def docker_available():
+    """Docker CLI var mı kontrol et"""
     try:
-        subprocess.run(["docker", "--version"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(["docker", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return True
     except Exception:
         return False
 
 
 def ensure_srs():
+    """Docker Desktop aç, sonra SRS'yi başlat"""
     if not docker_available():
-        return "Docker bulunamadı"
+        return "Docker CLI bulunamadı (Docker Desktop kurulu mu?)"
+
+    # Docker Desktop'ı aç
+    docker_desktop_path = r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
+    if os.path.isfile(docker_desktop_path):
+        subprocess.Popen([docker_desktop_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Docker Engine açılana kadar bekle
+    for _ in range(40):  # max ~40 sn
+        try:
+            subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            break
+        except Exception:
+            time.sleep(1)
+    else:
+        return "Docker Engine başlatılamadı!"
+
+    # Container var mı kontrol et
     exists = subprocess.run(["docker", "inspect", SRS_NAME],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     if exists:
@@ -73,108 +73,89 @@ def ensure_srs():
         return "SRS oluşturuldu" if rc == 0 else "SRS oluşturulamadı"
 
 
-def start_stream(rtmp_url):
-    if not os.path.isfile(ffmpeg_path):
-        messagebox.showerror("Hata", f"FFmpeg bulunamadı: {ffmpeg_path}")
+def open_mobile_hotspot():
+    """Windows mobil etkin nokta ayarlarını aç"""
+    try:
+        subprocess.Popen("start ms-settings:network-mobilehotspot", shell=True)
+    except Exception as e:
+        messagebox.showerror("Hata", f"Mobil etkin nokta açılamadı: {e}")
+
+
+def start_stream():
+    """FFmpeg üzerinden RTMP yayını al ve göster"""
+    if not os.path.isfile(FFMPEG_PATH):
+        messagebox.showerror("Hata", f"FFmpeg bulunamadı: {FFMPEG_PATH}")
         return
 
     cmd = [
-        ffmpeg_path,
+        FFMPEG_PATH,
         "-fflags", "+genpts",
-        "-rtmp_buffer", str(rtmp_buffer_ms),
-        "-i", rtmp_url,
-        "-max_delay", str(max_delay_us),
+        "-rtmp_buffer", str(BUFFER_SECONDS * 1000),
+        "-i", RTMP_URL,
+        "-max_delay", str(BUFFER_SECONDS * 1000000),
         "-f", "image2pipe",
         "-pix_fmt", "bgr24",
         "-vcodec", "rawvideo",
         "-"
     ]
 
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
-    set_label(connection_label, "Bağlantı: Bağlanıyor...")
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
+    except Exception as e:
+        messagebox.showerror("Hata", f"FFmpeg başlatılamadı: {e}")
+        return
 
-    frame_count, t0 = 0, time.time()
+    width, height = 1280, 720  # yayının çözünürlüğü
 
     while True:
-        raw = process.stdout.read(width * height * 3)
-        if not raw:
-            set_label(connection_label, "Bağlantı: HATA - Yayın yok!")
+        raw_image = process.stdout.read(width * height * 3)
+        if not raw_image:
             break
 
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
-        frame_count += 1
-        elapsed = time.time() - t0
-        if elapsed >= 2.0:
-            fps = frame_count / elapsed
-            set_label(fps_label, f"FPS: {fps:.2f}")
-            set_label(connection_label, "Bağlantı: Aktif")
-            frame_count, t0 = 0, time.time()
+        frame = np.frombuffer(raw_image, dtype=np.uint8).reshape((height, width, 3))
+        cv2.imshow("DJI Live Stream", frame)
 
-        overlay = frame.copy()
-        info = f"{rtmp_url} | Buffer: {rtmp_buffer_ms/1000:.0f}s"
-        cv2.putText(overlay, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255,255,255), 2, cv2.LINE_AA)
-        cv2.imshow("DJI Live (Buffered)", overlay)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     process.terminate()
     cv2.destroyAllWindows()
-    set_label(connection_label, "Bağlantı: Kapalı")
 
 
-def set_label(lbl, text):
-    try:
-        lbl.after(0, lbl.config, {"text": text})
-    except Exception:
-        pass
+# --- UI fonksiyonları ---
+def on_docker_start():
+    def task():
+        status = ensure_srs()
+        lbl_status.config(text=f"Docker: {status}")
+    threading.Thread(target=task, daemon=True).start()
 
 
-# ==== UI ====
+def on_stream_start():
+    threading.Thread(target=start_stream, daemon=True).start()
+
+
+# --- Arayüz ---
 root = tk.Tk()
-root.title("DJI RTMP Stream Controller")
-root.geometry("560x420")
+root.title("DJI RTMP Viewer")
+root.geometry("500x300")
 
-# mobil etkin nokta ekranını aç
-open_mobile_hotspot_settings()
+btn_hotspot = tk.Button(root, text="Mobil Etkin Nokta Aç", command=open_mobile_hotspot, height=2, width=25)
+btn_hotspot.pack(pady=10)
 
-tk.Label(root, text="DJI RTMP Görüntüleyici", font=("Segoe UI", 14, "bold")).pack(pady=10)
+btn_docker = tk.Button(root, text="Docker Başlat (SRS)", command=on_docker_start, height=2, width=25)
+btn_docker.pack(pady=10)
 
-info_frame = tk.Frame(root)
-info_frame.pack(pady=5, fill="x", padx=12)
+lbl_status = tk.Label(root, text="Docker: Durum bilinmiyor", fg="blue")
+lbl_status.pack(pady=5)
 
-rtmp_url = f"rtmp://{FIXED_IP}/live/stream"
-rtmp_label = tk.Label(info_frame, text=f"RTMP URL: {rtmp_url}", font=("Segoe UI", 11))
-rtmp_label.grid(row=0, column=0, sticky="w", padx=4, pady=2, columnspan=2)
+lbl_info = tk.Label(
+    root,
+    text=f"RTMP URL: {RTMP_URL}\nFPS: {FPS}\nGecikme: {BUFFER_SECONDS} sn",
+    fg="black"
+)
+lbl_info.pack(pady=10)
 
-buffer_label = tk.Label(info_frame, text=f"Buffer: {rtmp_buffer_ms/1000:.0f} sn", font=("Segoe UI", 11))
-buffer_label.grid(row=1, column=0, sticky="w", padx=4, pady=2)
-
-status_frame = tk.Frame(root)
-status_frame.pack(pady=10, fill="x", padx=12)
-
-docker_label = tk.Label(status_frame, text="Docker: -", font=("Segoe UI", 11))
-docker_label.pack(anchor="w", pady=2)
-
-connection_label = tk.Label(status_frame, text="Bağlantı: -", font=("Segoe UI", 11))
-connection_label.pack(anchor="w", pady=2)
-
-fps_label = tk.Label(status_frame, text="FPS: -", font=("Segoe UI", 11))
-fps_label.pack(anchor="w", pady=2)
-
-
-def on_connect():
-    s = ensure_srs()
-    set_label(docker_label, f"Docker: {s}")
-    threading.Thread(target=start_stream, args=(rtmp_url,), daemon=True).start()
-
-
-btn_frame = tk.Frame(root)
-btn_frame.pack(pady=16)
-
-tk.Button(btn_frame, text="Bağlan", command=on_connect,
-          font=("Segoe UI", 11, "bold"), bg="#2e7d32", fg="white", width=14).pack()
-
-tk.Label(root, text="OpenCV penceresi açıkken 'q' ile çıkabilirsiniz.", font=("Segoe UI", 9), fg="#666").pack(pady=4)
+btn_start = tk.Button(root, text="Bağlan ve Görüntüyü Aç", command=on_stream_start, height=2, width=25)
+btn_start.pack(pady=10)
 
 root.mainloop()
