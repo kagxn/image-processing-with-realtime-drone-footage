@@ -11,7 +11,7 @@ from tkinter import ttk
 
 # ==================== KULLANICI AYARLARI ====================
 FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"         # <-- KENDİ ffmpeg yolun
-RTMP_URL    = "rtmp://192.168.137.1/live/stream"  # Mobile Hotspot varsayılan gateway
+RTMP_URL    = "rtmp://ip/live/stream"  # Mobile Hotspot varsayılan gateway
 WIDTH, HEIGHT = 1280, 720
 TARGET_FPS   = 30
 BUFFER_SEC   = 20
